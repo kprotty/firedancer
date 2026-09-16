@@ -109,14 +109,33 @@ static inline void
 fd_zle_copy( uchar *       FD_RESTRICT d,
              uchar const * FD_RESTRICT s,
              ulong                     sz ) {
-  ulong k = 0UL;
-  for( ; k+64UL<=sz; k+=64UL ) {
-    wwb_stu( d+k, wwb_ldu( s+k ) );
+  /* A 64B-chunk loop here is folded by clang's loop-idiom pass into a
+     memcpy PLT call (vzeroupper + spill/reload + call) even on the
+     6-70 B literal runs of the w2/w3/w4 fast paths, where it is a large
+     fraction of encode time -- and on every frame of fd_zle_decompress.
+     Straight-line masked stores, no loop, so it stays inline. */
+  __mmask64 m;
+  if( FD_LIKELY( sz<=64UL ) ) {
+    m = _cvtu64_mask64( _bzhi_u64( ~0UL, (uint)sz ) ); /* bzhi saturates at 64 */
+    _mm512_mask_storeu_epi8( (void *)d, m, _mm512_maskz_loadu_epi8( m, s ) );
+    return;
   }
-  if( k<sz ) {
-    __mmask64 m = _cvtu64_mask64( ~0UL>>( 64UL-( sz-k ) ) );
-    _mm512_mask_storeu_epi8( (void *)( d+k ), m, _mm512_maskz_loadu_epi8( m, s+k ) );
+  if( FD_UNLIKELY( sz>256UL ) ) { fd_memcpy( d, s, sz ); return; }
+  wwb_stu( d, wwb_ldu( s ) );
+  if( FD_LIKELY( sz<=128UL ) ) {
+    m = _cvtu64_mask64( _bzhi_u64( ~0UL, (uint)( sz-64UL ) ) );
+    _mm512_mask_storeu_epi8( (void *)( d+64UL ), m, _mm512_maskz_loadu_epi8( m, s+64UL ) );
+    return;
   }
+  wwb_stu( d+64UL, wwb_ldu( s+64UL ) );
+  if( sz<=192UL ) {
+    m = _cvtu64_mask64( _bzhi_u64( ~0UL, (uint)( sz-128UL ) ) );
+    _mm512_mask_storeu_epi8( (void *)( d+128UL ), m, _mm512_maskz_loadu_epi8( m, s+128UL ) );
+    return;
+  }
+  wwb_stu( d+128UL, wwb_ldu( s+128UL ) );
+  m = _cvtu64_mask64( _bzhi_u64( ~0UL, (uint)( sz-192UL ) ) );
+  _mm512_mask_storeu_epi8( (void *)( d+192UL ), m, _mm512_maskz_loadu_epi8( m, s+192UL ) );
 }
 
 #define FD_ZLE_ZERO_THRESH (512UL)
@@ -128,6 +147,18 @@ fd_zle_zero( uchar * d,
   if( FD_LIKELY( sz<=64UL ) ) {
     /* _bzhi_u64 saturates at 64, so sz==64 yields the full mask */
     _mm512_mask_storeu_epi8( (void *)d, _cvtu64_mask64( _bzhi_u64( ~0UL, sz ) ), z );
+    return;
+  }
+  if( FD_LIKELY( sz<=256UL ) ) {
+    /* Straight line, no loop: a loop here is folded to a memset PLT call
+       (vzeroupper + spill/reload) in the middle of the vectorized
+       decoder, which costs more than it saves on account-sized runs. */
+    wwb_stu( d, z );
+    if( FD_LIKELY( sz<=128UL ) ) { wwb_stu( d+sz-64UL, z ); return; }
+    wwb_stu( d+64UL, z );
+    if( sz<=192UL ) { wwb_stu( d+sz-64UL, z ); return; }
+    wwb_stu( d+128UL, z );
+    wwb_stu( d+sz-64UL, z );
     return;
   }
   if( FD_LIKELY( sz<FD_ZLE_ZERO_THRESH ) ) {
@@ -395,18 +426,32 @@ fd_zle_big( uchar *       FD_RESTRICT dst,
       }
     }
 
-    /* ctz(d+lo) gives the index of the zero run's final byte */
+    /* ctz(d+lo) gives the index of the zero run's final byte.  ze is
+       computed as the run's *absolute end position* directly --
+       (w<<6)+ctz(x)+1 -- rather than as zs+len via a len that itself
+       subtracted b back out (len = ctz(x)-b+1, zs = (w<<6)+b): those
+       two `b` terms cancel algebraically, so the old form spent a
+       data-dependent subtract-then-add on the loop-carried chain
+       (ctz(x)-b, then +1, then +zs) recomputing a value ((w<<6)+ctz(x)+1)
+       that never actually depended on b.  ze folds to one `w<<6 + x + 1`
+       add (disp+base+index all available before ctz(x) resolves except
+       the index itself, so it's LEA-able) and fs becomes ze directly --
+       no separate zs+len add.  len is still needed for the MIN_Z test
+       and the emitted Z field, but off the fs dependency chain instead
+       of on it. */
 
-    ulong lo = d & ( ~d+1UL ); /* lowest candidate */
+    ulong lo = (ulong)_blsi_u64( d ); /* lowest candidate */
     ulong b  = (ulong)__builtin_ctzll( d );
     ulong zs = ( w<<6 )+b;
     ulong x  = d + lo;
-    ulong len;
+    ulong len, ze;
     if( FD_LIKELY( x ) ) {
-      len = (ulong)__builtin_ctzll( x )-b+1UL;
-      d   = x & ( x-1UL );
+      ze  = ( w<<6 )+(ulong)__builtin_ctzll( x )+1UL;
+      len = ze-zs;
+      d   = (ulong)_blsr_u64( x );
     } else { /* x==0: run hit the word end */
       len = fd_zle_spill( src, n, words, &w, &m, 64UL-b );
+      ze  = zs+len;
       d   = fd_zle_cand( m, 1UL );
     }
     if( FD_LIKELY( len>=FD_ZLE_MIN_Z ) ) {
@@ -414,7 +459,7 @@ fd_zle_big( uchar *       FD_RESTRICT dst,
       if( FD_UNLIKELY( (ulong)o+L+15UL>=lim ) &&
           (ulong)o+fd_zle_frame_sz( L, len )>=lim ) goto escape;
       o  = fd_zle_emit( o, src+fs, L, len );
-      fs = zs+len;
+      fs = ze;
     }
   }
 

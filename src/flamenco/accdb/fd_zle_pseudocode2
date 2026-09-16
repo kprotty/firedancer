@@ -1,0 +1,122 @@
+# [ header:u8, payload... ]
+# [ type:u2{raw=0, fill=1, last=2, more=3}, ext:u6 ]:header
+#  [ L:u8, Z:u8 ]:token
+#    if L == 0xff: L += read_varint(payload)
+#    if Z == 0xff: Z += read_varint(payload)
+#
+#  type.raw: payload is uncompressed bytes, copy all out
+#   real payload to copy starts at header.ext byte offset in payload
+#
+#  type.fill: write out n zero bytes
+#   n = header.ext
+#   if n == 63: n += read_varint(payload)
+#   n += 1
+#
+#  type.last: payload is single frame. 
+#   literals written forward from payload[2..]
+#   tokens written backwards from payload[-1]
+#   payload[0..2] contains the first token (L,Z) header
+#
+#  type.more: read a frame from the payload:
+#   [size_ext:u16, literals:[size]u8, tokens: [...]u8]
+#     where size:u22 = (size_ext<<6)|header.ext
+#   tokens are located after literals, written forwards
+
+
+
+
+
+zle_copy(dst, src, len):
+    if likely(len <= 64)
+        k = bzhi(~0u64, len)
+        vmask_store(k, vmaskz_load(k, src), dst)
+        return
+    if unlikely(len > 256):
+        memcpy(dst, src, len)
+        return
+    v0 = vload(src)
+    v1 = vload(src+(len/2)*64)
+    v2 = vload(src+(len-1)*64)
+    v3 = vload(src+len-64)
+    vstore(dst, v0)
+    vstore(dst+(len/2)*64, v1)
+    vstore(dst+(len-1)*64, v2)
+    vstore(dst+len-64, v3)
+
+zle_zero(dst, len):
+    if likely(len <= 64)
+        k = bzhi(~0u64, len)
+        vmask_store(k, vzero, dst)
+        return
+    if unlikely(len > 256):
+        memset(dst, 0, len)
+        return
+    vstore(dst, vzero)
+    vstore(dst+(len/2)*64, vzero)
+    vstore(dst+(len-1)*64, vzero)
+    vstore(dst+len-64, vzero)
+
+
+zle_compress_small(dst, src, len):
+    assume_le(len, 64)
+
+    k = bzhi(~0u64, len)
+    v = vmaskz_load(k, src)
+    m = vcmpeqb_mask(v, {0})
+    d = m & (m >> 1)
+    d = bzhi(d, len-1)
+    
+    if likely(d == 0): # raw
+        dst[0] = RAW
+        vmask_store(k, v, dst+1)
+        return len+1
+
+    if unlikely(d == bzhi(~0u64, len-1)): # all zeroes
+        dst[0] = FILL | ((len-1)<<2) # guaranted <= 63
+        dat[1] = 0 # preemptive varint write if len-1=63
+        return (len-1)==63 ? 2 : 1
+
+    tok: [128]u8
+    tpos = tok.len
+    base = 0
+    out = dst + 3
+
+tok_loop:
+    start = tzcnt(d) # find lowest bit
+    lo = d & -d # isolate lowest bit
+    d += lo # add lowest, ripple through 1-bit chain, keeping last zero-bit set
+    end = tzcnt(d) + 1 # find last zero-bit (+1 to get true zero-len)
+    d &= d - 1 # remove last zero-bit for next iteration to find next zero run
+
+    if start > len: start = len # cmov
+    if end > len: end = len # cmov
+
+    L = start - base
+    zle_copy(out, src + base, assume_le(L, 64))
+    out += L
+    base = end
+    tok[tpos-1] = u8(end - n) # Z
+    tok[tpos-2] = u8(L)
+    tpos -= 2
+    if d != 0: goto tok_loop
+
+    L = len >= base ? len - base : 0 # last L
+    zle_copy(out, src + base, assume_le(L, 64))
+    out += L
+    tok[tpos-1] = u8(L)
+    tpos -= 1
+
+    dst[0] = LAST
+    dst[1,2] = tok[tok.len-2,tok.len-1]
+
+    n = (tok.len-2)-tpos
+    zle_copy(out, &tok[tpos], n)
+    out += n
+    return out - dst # return bytes written
+
+
+
+zle_compress(dst, src, len):
+    if len <= 64: return zle_compress_small(dst, src, len)
+    todo()
+        

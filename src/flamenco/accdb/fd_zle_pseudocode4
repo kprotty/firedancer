@@ -1,0 +1,296 @@
+
+
+def zle_zero(dst, len):
+    vzero = vbroadcastb(0)
+    if len > 64: goto fill_big
+    vmask_storeu(bzhi(~0u64, len), vzero, dst)
+    return
+fill_big:
+    if len >= 512: goto fill_huge
+    p = 0
+fill_big_loop:
+    vstoreu(dst+p, vzero)
+    p += 64
+    if p+64 < len: goto fill_big_loop
+    vstoreu(dst+len-64, vzero)
+    return
+fill_huge:
+    return memset(dst, 0, len)
+
+def zle_copy64(dst, src, len):
+    k = bzhi(~0u64, len)
+    vmask_storeu(k, vmaskz_loadu(k, src), dst)
+    return
+
+def zle_copy<narrow: bool>(dst, src, len):
+    if len > 64: goto copy_big
+    return zle_copy64(dst, src, len)
+copy_big:
+    if (not narrow) and len > 256: goto copy_huge
+    tail = len-64
+    mid_a = min(tail, 64)
+    mid_b = min(tail, 128)
+    vstoreu(dst, vloadu(src))
+    vstoreu(dst+tail, vloadu(src+tail))
+    vstoreu(dst+mid_a, vloadu(src+mid_a))
+    vstoreu(dst+mid_b, vloadu(src+mid_b))
+    return
+copy_huge:
+    return memcpy(dst, src, len)
+
+def zle_put_int<narrow: bool>(out, n):
+    if (not narrow) and n >= 0xff: goto put_varint
+    out[0] = u8(n)
+    return out+1
+put_varint:
+    n -= 0xff
+    v = 0xff
+put_varint_loop:
+    *out++ = v
+    v = (n & 0x7f) | 0x80
+    n >>= 7
+    if n > 0: goto put_varint_loop # uses ZF from shr
+    out[0] = v & 0x7f
+    return out+1
+
+def zle_compress_core<narrow: bool>(dst, src, len):
+    assume(len >= 64)
+    out = dst
+    end = src + len
+    base = src
+
+zero_scan:
+    if src+64 >= end: goto zero_scan_last
+    v = vor(vloadu(src), vloadu(src+1))
+    d = vtestn_u8_mask(v, v)
+    if d > 0: goto run
+    src += 64
+    if narrow or src+256 >= end: goto zero_scan
+zero_scan_big:
+    v0 = vor(vloadu(src+64*0), vloadu(src+64*0+1))
+    v1 = vor(vloadu(src+64*1), vloadu(src+64*1+1))
+    v2 = vor(vloadu(src+64*2), vloadu(src+64*2+1))
+    v3 = vor(vloadu(src+64*3), vloadu(src+64*3+1))
+
+    t = vminb(vminb(v0, v1), vminb(v2, v3))
+    if vtestn_u8_mask(t, t): goto zero_scan_found_big
+    src += 256
+    if src+256 < end: goto zero_scan_big
+    goto zero_scan
+
+zero_scan_found_big:
+    d = vtestn_u8_mask(v0, v0)
+    if d > 0: goto run
+    src += 64
+    d = vtestn_u8_mask(v1, v1)
+    if d > 0: goto run
+    src += 64
+    d = vtestn_u8_mask(v2, v2)
+    if d > 0: goto run
+    src += 64
+    d = vtestn_u8_mask(v3, v3)
+run:
+    zpos = src+tzcnt(d)
+    if add_overflow(d, blsi(d), &d): goto long_zero
+    zend = src+tzcnt(d)+1 # tzcnt->lea
+    Z = zend-zpos
+    if Z < 3: goto run_skip
+    L = zpos-base
+    out = zle_put_int<narrow>(out, L)
+    zle_copy<narrow>(out, base, L)
+    out = zle_put_int<narrow>(out+L, Z)
+    base = zend
+run_skip:
+    d = blsr(d)
+    if d > 0: goto run # ZF flag from blsr
+    src += 64
+    goto zero_scan
+
+
+long_zero_found_big:
+    m = vtest_u8_mask(v0, v0)
+    off = tzcnt(m)
+    if m > 0: goto long_zero_emit
+    src += 64
+    m = vtest_u8_mask(v1, v1)
+    off = tzcnt(m)
+    if m > 0: goto long_zero_emit
+    src += 64
+    m = vtest_u8_mask(v2, v2)
+    off = tzcnt(m)
+    if m > 0: goto long_zero_emit
+    src += 64
+    m = vtest_u8_mask(v3, v3)
+    off = tzcnt(m)
+    goto long_zero_emit
+
+long_zero_big:
+    v0 = vloadu(src+64*0)
+    v1 = vloadu(src+64*1)
+    v2 = vloadu(src+64*2)
+    v3 = vloadu(src+64*3)
+
+    t = vor(vor(v0, v1), vor(v2, v3))
+    if vtest_u8_mask(t, t): goto long_zero_found_big
+    src += 256
+    if src+256 < end: goto long_zero_big
+
+    src -= 64
+long_zero:
+    src += 64
+    if src+64 >= end: goto long_zero_last
+long_zero_scan:
+    v = vloadu(src)
+    m = vtest_u8_mask(v, v)
+    off = tzcnt(m)
+    if m > 0: goto long_zero_emit
+    src += 64
+    if (not narrow) and src+256 < end: goto long_zero_big
+    if src+64 < end: goto long_zero_scan
+long_zero_last:
+    rem = end-src
+    v = vloadu(end-64)
+    m = vtest_u8_mask(v, v) >> (64-rem)
+    off = min(tzcnt(m), rem)
+long_zero_emit:
+    src += off
+    zend = src
+    Z = zend-zpos
+    if Z < 3 and zend != end: goto zero_scan
+    L = zpos-base
+    out = zle_put_int<narrow>(out, L)
+    zle_copy<narrow>(out, base, L)
+    out = zle_put_int<narrow>(out+L, Z)
+    base = zend
+    if src+64 < end: goto zero_scan
+    if src >= end: goto done
+zero_scan_last:
+    rem = end-src
+    v = vloadu(end-64)
+    d = vtestn_u8_mask(v, v) >> (64-rem)
+    d &= d>>1
+last_run:
+    zpos = src+tzcnt(d)
+    d += blsi(d)
+    zend = src+tzcnt(d)+1 # tzcnt->lea
+    Z = zend-zpos
+    if Z < 3 and zend != end: goto last_run_skip
+    L = zpos-base
+    out = zle_put_int<narrow>(out, L)
+    zle_copy<narrow>(out, base, L)
+    out = zle_put_int<narrow>(out+L, Z)
+    base = zend
+last_run_skip:
+    d = blsr(d)
+    if d > 0: goto last_run # branches with BLSR ZF
+
+trailing:
+    if base >= end: goto done
+    L = end-base
+    out = zle_put_int<narrow>(out, L)
+    zle_copy<narrow>(out, base, L)
+    out += L
+done:
+    return out-dst
+
+def zle_compress_tiny(dst, src, len):
+    assume(len > 0 and len <= 64)
+    out = dst
+    base = 0
+
+    v = vmaskz_loadu(bzhi(~0u64, len), src)
+    d = vtestn_u8_mask(v, v)
+    d = bzhi(d & (d >> 1), len-1)
+    if d == 0: goto emit_last
+loop:
+    zpos = tzcnt(d)
+    d += blsi(d)
+    zend = min(tzcnt(d)+1, len)
+
+    Z = zend-zpos
+    if Z < 3 and zend != len: goto loop_skip
+    L = zpos- base
+    out[0] = L
+    zle_copy64(out+1, src+base, L)
+    out[L+1] = Z
+    out += L+2
+    base = zend
+
+loop_skip:
+    d = blsr(d)
+    if d > 0: goto loop
+    if base == len: goto done
+emit_last:
+    L = len-base
+    out[0] = L
+    zle_copy64(out+1, src+base, L)
+    out += L+1
+done:
+    return out-dst
+
+# dst_len worst-case is len + len/386 + 6
+# returns number of bytes written to dst
+def zle_compress(dst, src, len):
+    if len == 0: return 0
+    if len <= 64: return zle_compress_tiny(dst, src, len)
+    if len < 255: return zle_compress_core<true>(dst, src, len)
+    return zle_compress_core<false>(dst, src, len)
+
+# returns either number of bytes written to dst, or an error
+# ZLE_ERR_INVALID_INPUT = dst/dst_len or src/src_len are invalid ptr ranges
+# ZLE_ERR_INVALID_STREAM = the stream has invalid contents
+# ZLE_ERR_SMALL_OUTPUT = the dst isnt big enough to hold the stream
+def zle_decompress(dst, dst_len, src, src_len):
+    if src_len == 0: return 0
+    if add_overflow(dst, dst_len, &dst_end): goto err_input
+    if add_overflow(src, src_len, &src_end): goto err_input
+    out = dst
+
+loop:
+    L = *src++
+    if L < 0xff: goto copy_lit
+    k = 0
+    v = 0
+read_varint_L:
+    if src == src_end or k > 42: goto err_invalid
+    b = *src++
+    v |= (b & 0x7f) << k
+    k += 7
+    if (b & 0x80) > 0: goto read_varint_L
+    L = v + 0xff
+
+copy_lit:
+    if L > (dst_end-out): goto err_space
+    if L > (src_end-src): goto err_invalid
+    zle_copy<false>(out, src, L)
+    out += L
+    src += L
+    if src == src_end: goto done
+
+    Z = *src++
+    if Z < 0xff: goto write_zeroes
+    k = 0
+    v = 0
+read_varint_Z:
+    if src == src_end or k > 42: goto err_invalid
+    b = *src++
+    v |= (b & 0x7f) << k
+    k += 7
+    if (b & 0x80) > 0: goto read_varint_Z
+    Z = v + 0xff
+
+write_zeroes:
+    if Z > (dst_end-out): goto err_space
+    zle_zero(out, Z)
+    out += Z
+    if src < src_end: goto loop
+done:
+
+    return out-dst
+
+err_input:
+    return ZLE_ERR_INVALID_INPUT
+err_invalid:
+    return ZLE_ERR_INVALID_STREAM
+err_space:
+    return ZLE_ERR_SMALL_OUTPUT

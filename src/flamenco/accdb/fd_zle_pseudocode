@@ -1,0 +1,39 @@
+# A ZLE buffer is a sequence of frames:
+# [ size:u32, literals:[size]u8, tokens:[...]u8 ]: frame
+#   If size=0, all literals are copied to dst and stream ends.
+#   If size>0, tokens are consumed from bytes after the literals until the tokens consume all literals in the frame.
+# A token is an (L, Z) pair, telling decoder to copy L bytes from frame.literals then write Z zeroes.
+#   [ L:u8, Z:u8, ext:[...]u8 ]: token
+#   for &n in (L, Z): if n == 0xff: n = ext.read(u32)
+#   Z += 2 (the minimum zero-run match)
+#
+# The encoding is this way so that, while scanning literals for a zero run, 
+# those literals can be copied to compressed out (without having to go back and copy them).
+# It also allows encoder to buffer (L, Z) pairs then dumb them out as needed.
+#
+# To scan for zero runs in literals, its recommended to load bytes in chunks of N, then check overlapping ranges:
+#   c = load_chunk(src); t = bit_or(c, load_chunk(src+1));
+#   if no zero-byte in t: copy `c` to output frame.literals and continue scanning chunks
+#   if zero-byte in t: there is a zero-run there with len >= 2.
+#     seal L, then start scanning for zero byte runs at that position in src to get Z
+
+compress_tiny(dst, src, len):
+    c = mm512_mask_load(bzhi(~0u64, len), src)
+    ...
+
+compress_small(dst, src, len):
+    for i in 0..4:
+        n = len > (64*i) ? (len-64*i) : 0
+        c[i] = mm512_mask_load(bzhi(~0u64, n), src+64*i)
+    ... 
+
+compress_big(dst, src, len):
+    # see above
+
+compress(dst, src, len):
+    if len < 64: return compress_tiny(dst, src, len)
+    if len < 256: return compress_small(dst, src, len)
+    return compress_big(dst, src, len)
+
+    
+        

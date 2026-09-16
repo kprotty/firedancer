@@ -1,0 +1,130 @@
+
+
+
+
+zle_compress_tiny(dst, src, len):
+    assume(len > 0 and len <= 64)
+    v = vmaskz_loadu(kmov(bzhi(~0u64, len)), src)
+    d = kmov(vtestn_u8_mask(v, v))
+    d = bzhi(d & (d >> 1), len-1)
+    Lpos = 0
+    out = dst
+loop:
+    Zpos = tzcnt(d)
+    if Zpos >= len: goto finish
+    d += blsi(d)
+    Zend = tzcnt(d) + 1
+    if Zend >= len: Zend = len # cmov
+
+    L = Zpos - Lpos
+    Z = Zend - Zpos
+    k = kmov(bzhi(~0u64, L))
+    v = vmaskz_loadu(k, src + Lpos)
+    Lpos = Zend
+
+    out[0] = u8(L)
+    vmask_storeu(k, v, out + 1)
+    out[L + 1] = u8(Z)
+    out += L + 2
+
+    d = blsr(d)
+    if d > 0: goto loop
+finish:
+    L = len - Lpos
+    if L == 0: goto done
+
+    k = kmov(bzhi(~0u64, L))
+    v = vmaskz_loadu(k, src + Lpos)
+    out[0] = u8(L)
+    vmaskz_storeu(k, v, out + 1)
+    out += L + 1
+done:
+    return usize(out-dst)
+
+zle_compress_small(dst, src, len):
+    assume(len > 64 and len < 255)
+    out = dst
+    end = src+len
+    base = src
+
+scan:
+    v = vor(vloadu(src), vloadu(src+1))
+    k = vtestn_u8_mask(v, v)
+    d = kmov(k)
+    if not kortestz(k, k): goto found
+    src += 64
+    if src+64 < end: goto scan
+scan_last:
+    n = end-src
+    v = vloadu(end-64)
+    d = kmov(vtestn_u8_mask(v, v)) >> (64-n)
+    d &= d >>= 1
+    if d > 0: goto found
+last_literals:
+    L = end-base
+    out[0] = u8(L)
+    zle_copy(out+1, base, L)
+    out += L + 1
+    return out-dst
+
+found:
+    Zpos = src+tzcnt(d)
+    if add_overflow(d, blsi(d), &d): goto lz_loop
+    src += tzcnd(d)+1
+    Z = src - Zpos
+    if Z < 3: goto skip_emit
+emit_L:
+    L = Zpos - base
+    out[0] = u8(L)
+    out[L+1] = u8(Z)
+    zle_copy(out+1, base, L)
+    out += (L+Z)+1
+    base = src
+skip_emit:
+    if src+64 < end: goto scan
+    goto scan_last
+
+lz_loop:
+    src += 64
+    if src+64 >= end: goto lz_last
+    v = vloadu(src)
+    k = vtest_u8_mask(v, v)
+    d = kmov(k)
+    if kortestz(k, k): goto lz_loop
+    src += tzcnt(d)
+    Z = src - Zpos
+    goto emit
+lz_last:
+    n = end-src
+    v = vloadu(end-64)
+    d = kmov(vtest_u8_mask(v, v)) >> (64-n)
+    src += tzcnt(d)
+    Z = src - Zpos
+    goto emit
+    
+
+
+
+
+zle_compress(dst, src, len):
+    if len == 0: return 0
+    if len <= 64: return zle_compress_tiny(dst, src, len)
+    if len < 255: return zle_compress_small(dst, src, len)
+    # TODO
+
+
+zle_put_vint(out, n):
+    if likely(n < 0xff):
+        out[0] = u8(n)
+        return out + 1
+    n -= 0xff
+    v = 0xff 
+loop:
+    out[0] = v
+    out += 1
+    v = (n & 0x7f) | 0x80
+    n >>= 7
+    if n > 0: goto loop
+    out[0] = v & 0x7f
+    return out
+
