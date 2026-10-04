@@ -13,6 +13,7 @@
 #include "../../flamenco/runtime/fd_runtime.h" /* for fd_runtime_load_txn_address_lookup_tables */
 #include "../../flamenco/runtime/fd_system_ids.h"
 #include "../../flamenco/runtime/sysvar/fd_sysvar_slot_hashes.h" /* for ALUTs */
+#include "../../util/math/fd_rcp.h"
 
 #define FD_SCHED_MAX_STAGING_LANES_LOG     (2)
 #define FD_SCHED_MAX_STAGING_LANES         (1UL<<FD_SCHED_MAX_STAGING_LANES_LOG)
@@ -1178,6 +1179,9 @@ fd_sched_fec_ingest( fd_sched_t *     sched,
   if( FD_LIKELY( fec->shred_cnt<=FD_FEC_SHRED_CNT ) ) FD_TEST( tracked_data_sz==fec->fec->data_sz );
   else                                                FD_TEST( tracked_data_sz<=fec->fec->data_sz );
 
+  /* Only used if fec->shred_cnt>FD_FEC_SHRED_CNT */
+  fd_rcp_t num_overflow_shreds_rcp = fd_rcp( fd_ulong_sat_sub( fec->shred_cnt, FD_FEC_SHRED_CNT ) );
+
   uint prev_shred_off = 0U;
   for( ulong i=0; i<fec->shred_cnt; i++ ) {
     FD_TEST( block->shred_cnt<sched->max_shreds_per_block );
@@ -1187,10 +1191,9 @@ fd_sched_fec_ingest( fd_sched_t *     sched,
     } else if( FD_UNLIKELY( i!=fec->shred_cnt-1UL ) ) {
       /* We don't track shred boundaries after 32 shreds, assume they're
          sized uniformly */
-      ulong num_overflow_shreds = fec->shred_cnt-FD_FEC_SHRED_CNT;
       ulong overflow_idx        = i-FD_FEC_SHRED_CNT;
       ulong overflow_data_sz    = (ulong)fec->fec->data_sz-tracked_data_sz;
-      shred_off = tracked_data_sz + (uint)(overflow_data_sz / num_overflow_shreds * (overflow_idx + 1UL));
+      shred_off = tracked_data_sz + (uint)(fd_rcp_div( num_overflow_shreds_rcp, overflow_data_sz ) * (overflow_idx + 1UL));
     } else {
       shred_off = (uint)fec->fec->data_sz;
     }

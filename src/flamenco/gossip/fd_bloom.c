@@ -77,6 +77,7 @@ fd_bloom_new( void *     shmem,
   bloom->keys_len  = 0UL;
   bloom->bits      = (ulong *)_bits;
   bloom->bits_len  = 0UL;
+  bloom->bits_rcp  = fd_rcp( 0UL );
 
   bloom->hash_seed = 0UL;
   bloom->rng       = rng;
@@ -129,6 +130,7 @@ fd_bloom_initialize( fd_bloom_t * bloom,
 
   bloom->keys_len = num_keys;
   bloom->bits_len = (ulong)num_bits;
+  bloom->bits_rcp = fd_rcp( bloom->bits_len );
   fd_memset( bloom->bits, 0, (ulong)((num_bits+7UL)/8UL) );
 }
 
@@ -138,34 +140,19 @@ fd_bloom_insert( fd_bloom_t *  bloom,
                  ulong         key_sz ) {
   if( FD_UNLIKELY( !bloom->bits_len ) ) return;
   for( ulong i=0UL; i<bloom->keys_len; i++ ) {
-    ulong bit = fnv_hasher( key, key_sz, bloom->keys[ i ] ) % bloom->bits_len;
+    ulong hash = fnv_hasher( key, key_sz, bloom->keys[ i ] );
+    ulong bit = fd_rcp_mod( bloom->bits_rcp, hash );
     bloom->bits[ bit / 64UL ] |= (1UL << (bit % 64UL));
   }
 }
 
-#if FD_HAS_AVX512 && FD_HAS_INT128
-
-/* bloom_set sets bit h%bits_len.  magic is floor((2^64-1)/bits_len),
-   which makes q floor(h/bits_len) or one less. */
-
-static inline void
-bloom_set( ulong * bits,
-           ulong   bits_len,
-           ulong   magic,
-           ulong   h ) {
-  ulong q   = (ulong)(((uint128)h*(uint128)magic)>>64);
-  ulong bit = h - q*bits_len;
-  bit = fd_ulong_if( bit>=bits_len, bit-bits_len, bit );
-  bits[ bit/64UL ] |= 1UL<<(bit%64UL);
-}
+#if FD_HAS_AVX512
 
 void
 fd_bloom_insert8( fd_bloom_t *  bloom,
                   uchar const * ele,
                   uint          lanes ) {
-  ulong bits_len = bloom->bits_len;
-  if( FD_UNLIKELY( !bits_len || !lanes ) ) return;
-  ulong magic = ULONG_MAX/bits_len;
+  if( FD_UNLIKELY( !bloom->bits_len || !lanes ) ) return;
 
   /* Transpose so wq[k] lane j holds the k-th 8 byte word of an element.
      The lane to element map is 0,2,1,3,4,6,5,7. */
@@ -201,7 +188,10 @@ fd_bloom_insert8( fd_bloom_t *  bloom,
     wwv_st( h[0], h0 ); wwv_st( h[1], h1 ); wwv_st( h[2], h2 ); wwv_st( h[3], h3 );
     for( uint m=lane_mask; m; m&=m-1U ) {
       ulong j = (ulong)fd_uint_find_lsb( m );
-      for( ulong c=0UL; c<cnt; c++ ) bloom_set( bloom->bits, bits_len, magic, h[ c ][ j ] );
+      for( ulong c=0UL; c<cnt; c++ ) {
+        ulong bit = fd_rcp_mod( bloom->bits_rcp, h[ c ][ j ] );
+        bloom->bits[ bit/64UL ] |= 1UL<<(bit%64UL);
+      }
     }
   }
 }
@@ -225,7 +215,8 @@ fd_bloom_contains( fd_bloom_t *  bloom,
                    ulong         key_sz ) {
   if( FD_UNLIKELY( !bloom->keys_len || !bloom->bits_len ) ) return 0;
   for( ulong i=0UL; i<bloom->keys_len; i++ ) {
-    ulong bit = fnv_hasher( key, key_sz, bloom->keys[ i ]) % bloom->bits_len;
+    ulong hash = fnv_hasher( key, key_sz, bloom->keys[ i ] );
+    ulong bit = fd_rcp_mod( bloom->bits_rcp, hash );
     if( !(bloom->bits[ bit / 64UL ] & (1UL << (bit % 64UL))) ) {
       return 0;
     }
@@ -252,6 +243,7 @@ fd_bloom_init_inplace( ulong *      keys,
   out_bloom->keys_len            = keys_len;
   out_bloom->bits                = bits;
   out_bloom->bits_len            = bits_len;
+  out_bloom->bits_rcp            = fd_rcp( bits_len );
   out_bloom->hash_seed           = hash_seed;
   out_bloom->rng                 = rng;
   out_bloom->false_positive_rate = false_positive_rate;

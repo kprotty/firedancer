@@ -12,6 +12,7 @@
 
 #include "../../disco/events/generated/fd_event_gen.h"
 #include "../../disco/sleep/fd_sleep.h"
+#include "../../util/math/fd_rcp.h"
 #include "../runtime/fd_runtime_const.h" /* FD_RUNTIME_ACC_SZ_MAX */
 
 FD_STATIC_ASSERT( sizeof(fd_accdb_cache_line_t)==FD_ACCDB_CACHE_META_SZ, cache_meta_sz );
@@ -1691,8 +1692,9 @@ acquire_cache_line( fd_accdb_t * accdb,
   FD_ATOMIC_FETCH_AND_SUB( &accdb->shmem->cache_class_init[ size_class ].val, 1UL );
 
   /* Priority 3: CLOCK sweep ... scan forward giving second chances. */
+  fd_rcp_t class_max_rcp = fd_rcp( accdb->shmem->cache_class_max[ size_class ] );
   for(;;) {
-    ulong hand = FD_ATOMIC_FETCH_AND_ADD( &accdb->shmem->clock_hand[ size_class ].val, 1UL ) % accdb->shmem->cache_class_max[ size_class ];
+    ulong hand = fd_rcp_mod( class_max_rcp, FD_ATOMIC_FETCH_AND_ADD( &accdb->shmem->clock_hand[ size_class ].val, 1UL ) );
     fd_accdb_cache_line_t * line = cache_line( accdb, size_class, hand );
 
     if( FD_UNLIKELY( line->key.generation==UINT_MAX && line->acc_idx==UINT_MAX ) ) continue;

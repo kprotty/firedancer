@@ -2,6 +2,7 @@
 #define HEADER_fd_src_flamenco_gossip_fd_bloom_h
 
 #include "../../util/rng/fd_rng.h"
+#include "../../util/math/fd_rcp.h"
 
 #include <math.h>
 
@@ -16,6 +17,7 @@ struct __attribute__((aligned(FD_BLOOM_ALIGN))) fd_bloom_private {
 
   ulong * bits;
   ulong   bits_len;  /* bit count */
+  fd_rcp_t bits_rcp; /* ==fd_rcp( bits_len ) */
 
   ulong   hash_seed;
   fd_rng_t * rng;

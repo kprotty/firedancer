@@ -30,7 +30,7 @@ test_fnv_reference( void ) {
       ulong ref [ 64 ] = {0};
       ulong bits_len = 1UL + fd_rng_ulong_roll( rng, 64UL*64UL );
       for( ulong k=0UL; k<keys_len; k++ ) keys[ k ] = fd_rng_ulong( rng );
-      fd_bloom_t bloom[1] = {{ .keys = keys, .keys_len = keys_len, .bits = bits, .bits_len = bits_len }};
+      fd_bloom_t bloom[1] = {{ .keys = keys, .keys_len = keys_len, .bits = bits, .bits_len = bits_len, .bits_rcp = fd_rcp( bits_len ) }};
       uchar ele[ 40 ];
       ulong ele_sz = fd_rng_ulong_roll( rng, 41UL );
       for( ulong i=0UL; i<ele_sz; i++ ) ele[ i ] = fd_rng_uchar( rng );
@@ -60,8 +60,8 @@ test_insert8( void ) {
     if( iter&1UL ) for( ulong k=0UL; k<keys_len; k++ ) keys[ k ] = ULONG_MAX-fd_rng_ulong_roll( rng, 4UL );
     ulong bits0[ 151 ] = {0};
     ulong bits1[ 151 ] = {0};
-    fd_bloom_t b0[1] = {{ .keys = keys, .keys_len = keys_len, .bits = bits0, .bits_len = bits_len }};
-    fd_bloom_t b1[1] = {{ .keys = keys, .keys_len = keys_len, .bits = bits1, .bits_len = bits_len }};
+    fd_bloom_t b0[1] = {{ .keys = keys, .keys_len = keys_len, .bits = bits0, .bits_len = bits_len, .bits_rcp = fd_rcp( bits_len ) }};
+    fd_bloom_t b1[1] = {{ .keys = keys, .keys_len = keys_len, .bits = bits1, .bits_len = bits_len, .bits_rcp = fd_rcp( bits_len ) }};
     uchar ele[ 256 ];
     for( ulong i=0UL; i<256UL; i++ ) ele[ i ] = fd_rng_uchar( rng );
     uint lanes = fd_rng_uint( rng ) & 0xffU;

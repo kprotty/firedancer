@@ -690,6 +690,7 @@ rx_pull_request( fd_gossip_t *                    gossip,
   filter->keys = keys;
 
   filter->bits_len = pr_view->crds_filter->filter->bits_len;
+  filter->bits_rcp = fd_rcp( filter->bits_len );
   filter->bits     = bits;
 
   fd_gossip_txbuild_t pull_resp[1];
