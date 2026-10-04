@@ -1,0 +1,8 @@
+*.o
+*.ans
+ans_train
+ans_infer
+ans_test
+ans_bench_float
+ans_transformer
+data/
