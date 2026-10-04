@@ -1,0 +1,129 @@
+# token: u8 min(L,15)<<4 | min(Z,15)
+#        [vint(L-15) if L>=15] [vint(Z-15) if Z>=15] L literals
+# every zero run of >=2 bytes gets a token; the last token has Z=0.
+# decoder runs tokens until the stream is exhausted.
+
+zle_zero(dst, len) = memset(dst, 0, len)
+zle_copy(dst, src, len) = memcpy(dst, src, len)
+
+zle_copy64(dst, src, len):
+    k = bzhi(~0u64, len)
+    vmask_storeu_u8(dst, k, vmaskz_loadu_u8(k, src))
+
+# writes 8 bytes, returns out+n (n<=5 for 32 bit v)
+zle_put_vint(out, v):
+    z = lzcnt(v)
+    n = (640 - (z*8+z)) >> 6
+    lo = pdep(v, 0x7f7f7f7f7f7f7f7f)
+    lo |= bzhi(0x8080808080808080, 8*n-8)
+    memcpy(out, &lo, 8)
+    return out+n
+
+zle_emit(out, lp, zp, ze):
+    L = zp-lp
+    Z = ze-zp
+    *out++ = u8((L >= 15 ? 15 : L)*16 + (Z >= 15 ? 15 : Z))
+    if (L>=15) out = zle_put_vint(out, L-15)
+    if (Z>=15) out = zle_put_vint(out, Z-15)
+    zle_copy(out, lp, L)
+    return out+L
+
+zle_compress_tiny(dst, src, len):
+    lp = 0
+    out = dst
+    v = vloadu(src)                  # may read up to align_up(len, 64)
+    d = vtestn_u8_mask(v, v)
+    d = bzhi(d & (d >> 1), len-1)    # pairs past len
+    for (; d; d = blsr(d)):          # blsr clears the carry bit
+        zp = tzcnt(d)
+        d += blsi(d)                 # highest pair bit <= 62: no overflow
+        ze = tzcnt(d)+1
+        L = zp-lp
+        Z = ze-zp
+        *out++ = u8((L >= 15 ? 15 : L)*16 + (Z >= 15 ? 15 : Z))
+        *out = u8(L-15); out += int(L>=15)   # L,Z <= 64: one vint byte
+        *out = u8(Z-15); out += int(Z>=15)
+        zle_copy64(out, src+lp, L); out += L
+        lp = ze
+    if lp < len:
+        L = len-lp
+        *out++ = u8((L >= 15 ? 15 : L)*16)
+        *out = u8(L-15); out += int(L>=15)
+        zle_copy64(out, src+lp, L); out += L
+    return out-dst
+
+zle_compress(dst, src, len):
+    if len == 0: return 0
+    if len <= 64: return zle_compress_tiny(dst, src, len)
+
+    lp = src
+    out = dst
+    end = src+len
+
+find_zmask:                          # src+64 < end: pair load reads src+64
+    v = vor(vloadu(src), vloadu(src+1))
+    if (d = vtestn_u8_mask(v, v)): goto found_zmask
+next_word:
+    src += 64
+    if src+64 < end: goto find_zmask
+    if src >= end: goto last_literals
+find_zmask_last:                     # 1 <= end-src <= 64
+    v = vloadu(end-64)
+    d = vtestn_u8_mask(v, v) >> (64-(end-src))
+    d &= d >> 1                      # highest pair bit end-src-2: no overflow
+    if not d: goto last_literals
+found_zmask:
+    zp = src+tzcnt(d)
+    if add_overflow(d, blsi(d), &d): goto find_zend
+    ze = src+tzcnt(d)+1
+    out = zle_emit(out, lp, zp, ze)
+    lp = ze
+    if (d = blsr(d)): goto found_zmask
+    goto next_word
+
+find_zend:                           # run continues past src+64 (< end)
+    src += 64
+    if src+64 >= end: goto find_zend_last
+find_zend_loop:
+    v = vloadu(src)
+    if (m = vtest_u8_mask(v, v)): goto found_zend
+    src += 64
+    if src+64 < end: goto find_zend_loop
+find_zend_last:                      # 1 <= end-src <= 64
+    v = vloadu(end-64)
+    m = vtest_u8_mask(v, v) >> (64-(end-src))
+    ze = src+min(tzcnt(m), end-src)  # run may reach end
+    goto emit_zend
+found_zend:
+    ze = src+tzcnt(m)
+emit_zend:
+    out = zle_emit(out, lp, zp, ze)
+    lp = ze
+    src = ze
+    if src+64 < end: goto find_zmask
+    if src < end: goto find_zmask_last
+last_literals:
+    if lp >= end: goto done
+    L = end-lp
+    *out++ = u8((L >= 15 ? 15 : L)*16)
+    if (L>=15) out = zle_put_vint(out, L-15)
+    zle_copy(out, lp, L); out += L
+done:
+    return out-dst
+
+zle_decompress(dst, dst_sz, src, src_sz):
+    if src_sz == 0: return 0
+loop:
+    tok = *src++
+    L = tok >> 4
+    Z = tok & 15
+    if L == 15: L += get_vint(&src)       # err if truncated / >5 bytes
+    if Z == 15: Z += get_vint(&src)
+    if L > src_end-src: err stream
+    if L+Z > dst_end-dst: err space
+    if L+Z <= 64: vmask_storeu(dst, bzhi(~0, L+Z), vmaskz_loadu(bzhi(~0, L), src))
+    else: zle_copy(dst, src, L); zle_zero(dst+L, Z)
+    dst += L+Z
+    src += L
+    if src < src_end: goto loop
+    return dst-dst_start

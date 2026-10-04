@@ -103,6 +103,39 @@ $(call make-fuzz-test,fuzz_zle11_diff,fuzz_zle11_diff,fd_flamenco fd_util)
 $(call make-fuzz-test,fuzz_zle11_decompress,fuzz_zle11_decompress,fd_flamenco fd_util)
 endif
 
+$(call add-hdrs,fd_zle12.h)
+$(call add-objs,fd_zle12,fd_flamenco)
+
+$(call make-unit-test,test_zle12,test_zle12,fd_flamenco fd_util)
+$(call run-unit-test,test_zle12)
+$(call make-unit-test,bench_zle12,bench_zle12,fd_flamenco fd_util)
+ifdef FD_HAS_HOSTED
+$(call make-fuzz-test,fuzz_zle12_diff,fuzz_zle12_diff,fd_flamenco fd_util)
+endif
+
+$(call add-hdrs,fd_zle13.h)
+$(call add-objs,fd_zle13,fd_flamenco)
+
+$(call make-unit-test,test_zle13,test_zle13,fd_flamenco fd_util)
+$(call run-unit-test,test_zle13)
+$(call make-unit-test,bench_zle13,bench_zle13,fd_flamenco fd_util)
+ifdef FD_HAS_HOSTED
+$(call make-fuzz-test,fuzz_zle13_diff,fuzz_zle13_diff,fd_flamenco fd_util)
+endif
+
+ifdef FD_HAS_AVX512
+$(call add-hdrs,fd_zle14.h)
+$(call add-objs,fd_zle14,fd_flamenco)
+
+$(call make-unit-test,test_zle14,test_zle14,fd_flamenco fd_util)
+$(call run-unit-test,test_zle14)
+$(call make-unit-test,bench_zle14,bench_zle14,fd_flamenco fd_util)
+ifdef FD_HAS_HOSTED
+$(call make-fuzz-test,fuzz_zle14_diff,fuzz_zle14_diff,fd_flamenco fd_util)
+$(call make-fuzz-test,fuzz_zle14_decompress,fuzz_zle14_decompress,fd_flamenco fd_util)
+endif
+endif
+
 $(call add-hdrs,fd_zle8.h)
 $(call add-objs,fd_zle8,fd_flamenco)
 

@@ -28,7 +28,8 @@
 #define ALL_ZERO_BENCH_WORK_SZ (12UL<<30)
 
 static uchar in  [ MAX_SZ+64UL ] __attribute__((aligned(64)));
-static uchar comp[ FD_ZLE11_COMPRESS_BOUND( MAX_SZ ) ] __attribute__((aligned(64)));
+static uchar comp_buf[ FD_ZLE11_COMPRESS_BOUND( MAX_SZ )+4096UL ] __attribute__((aligned(64)));
+static uchar * comp = comp_buf; /* --comp-off shifts it to vary 4K aliasing with in */
 static uchar out [ MAX_SZ ] __attribute__((aligned(64)));
 
 static ulong volatile sink;
@@ -444,6 +445,9 @@ main( int     argc,
 
   uint seed = fd_env_strip_cmdline_uint( &argc, &argv, "--seed", NULL, 42U );
   int  do_synth = !fd_env_strip_cmdline_contains( &argc, &argv, "--no-synth" );
+  char const * only = fd_env_strip_cmdline_cstr( &argc, &argv, "--only", NULL, NULL ); /* case name filter */
+
+  comp = comp_buf + fd_env_strip_cmdline_ulong( &argc, &argv, "--comp-off", NULL, 0UL )%4096UL;
 
   fd_rng_t _rng[1];
   fd_rng_t * rng = fd_rng_join( fd_rng_new( _rng, seed, 0UL ) );
@@ -465,6 +469,8 @@ main( int     argc,
       synth_t const * s = synth+(i-SHAPE_CNT);
       name = s->name; acct = s->acct; sz = fill_synth( rng, s );
     }
+
+    if( only && !strstr( name, only ) ) continue;
 
     double enc_ns, dec_ns, cpy_ns;
     ulong  comp_sz = bench( name, sz, acct, BENCH_WORK_SZ, &enc_ns, &dec_ns, &cpy_ns );

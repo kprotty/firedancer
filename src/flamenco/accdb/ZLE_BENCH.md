@@ -586,3 +586,226 @@ got 7% smaller (0x618 -> 0x5c9) and faster on token/mint accounts but
 slower on tail 65-256.  perf over the whole bench shows the same hot
 instructions in both small paths (end-word `cmovae`, masked copy,
 Z-field store), plus reloads of the `-1` mask constant in zle10.
+
+## fd_zle14: block coded, written in assembly (2026-09-26)
+
+`fd_zle14.S` + `fd_zle14.h` + `fd_zle14_ref.h` (scalar reference, test
+only) + `test_zle14.c` / `bench_zle14.c` / `fuzz_zle14_diff.c` /
+`fuzz_zle14_decompress.c`.  A new wire format, and both routines written
+in x86-64 assembly rather than intrinsics.
+
+### Why a new format
+
+Every codec up to fd_zle13 walks a token stream: where the next token
+starts depends on the length field of the current one, so both sides
+carry a serial chain through the data -- a load, a field decode, a
+pointer add -- once per run.  On the dense shapes that chain *is* the
+cost: fd_zle11 decodes `tail 64K-1M` at 3 bytes/cycle where its uop count
+alone would allow eight.
+
+fd_zle14 codes the input in **64 byte blocks**.  Every block advances the
+input (encode) or the output (decode) by exactly 64 bytes, and the other
+cursor advances by a popcount of the block's literal mask, so neither
+side ever reads a length to find out where the next unit begins.  Blocks
+are grouped into chunks that keep their control bytes and their literal
+bytes in two runs rather than interleaved, so the control stream can be
+walked without stepping over literals.  Dense blocks store the literal
+mask itself (9 bytes), sparse ones a list of the zero runs' byte
+positions (1..4), and a run of all-zero or all-literal blocks costs one
+byte for up to 64 of them.  The format is documented at the top of
+`fd_zle14.S`.
+
+Two parameter choices matter and both were measured:
+
+- **MIN_Z=2, not 3.**  With block local runs, coding a 2 byte run costs
+  two position bytes and saves two literals, and the extra transitions
+  push more blocks into mask mode, which is both smaller and faster.  It
+  is *better* on ratio (30.93% vs 31.18% at the time) as well as one
+  shift/and pair cheaper per block.
+- **Mask mode at 5 transitions, not 9.**  A mask is 9 bytes against a
+  list's 5 to 8, which costs 0.2% of output, and buys a group whose
+  length neither side has to scan for: decode +6%.  4 and 6 both
+  measured worse.
+
+### Results (EPYC 9555P, core 56, clang-19, median of 7 whole-bench runs)
+
+| codec | ratio | encode | decode |
+|---|---|---|---|
+| fd_zle (committed) | 30.01% | 16.1 GB/s | 30.0 GB/s |
+| fd_zle11 (fastest before) | 30.40% | 27.5 GB/s | 35.0 GB/s |
+| fd_zle13 | 30.45% | 25.5 GB/s | 31.4 GB/s |
+| **fd_zle14** | **31.15%** | **37.7 GB/s** | **46.0 GB/s** |
+
+vs fd_zle11: **encode +37%, decode +31%**, ratio +2.5% relative.
+vs the committed fd_zle: encode **2.34x**, decode **1.53x**.
+The mix's memcpy roofline is 82 GB/s, so the encoder runs at 46% of it
+and the decoder at 56%.  (Run to run spread on a quiet core is ~1%; with
+anything else running on the socket decode swings 40-47.)
+
+Per shape, median of 3 whole-bench runs, weight = share of fd_zle11's
+mix time:
+
+| case | size | weight | enc | dec |
+|---|---|---|---|---|
+| spl-token account | 165 | 30% | 0.93x | 0.93x |
+| tail 64K-1M | 237237 | 17% | **5.7x** | **5.0x** |
+| tail 257-1K | 456 | 9% | 2.2x | 2.0x |
+| metaplex metadata | 607 | 8% | 1.6x | 1.3x |
+| token-2022 account | 170 | 6% | 0.99x | 0.92x |
+| tail >1M | 1958702 | 6% | 4.2x | 3.5x |
+| tail 4K-16K | 7771 | 5% | 2.4x | 1.7x |
+| tail 65-256 | 140 | 4% | 0.98x | 0.65x |
+| spl-token mint | 82 | 4% | 1.2x | 1.7x |
+| tail 1K-4K | 2175 | 3% | 2.8x | 2.6x |
+| meteora dlmm bins | 10136 | 2% | 1.4x | 0.81x |
+| metaplex metadata v1.3 | 679 | 2% | 1.8x | 1.7x |
+| tail 16K-64K | 29668 | 1% | **5.0x** | **4.5x** |
+| meteora damm v2 pool | 1112 | 0.6% | 2.0x | 2.0x |
+| raydium amm v4 info | 752 | 0.5% | 3.2x | 3.4x |
+| serum v3 slab | 14524 | 0.6% | 0.62x | 0.98x |
+| tail 1-64 / token record | 29 / 32 | 1% | 0.40x | 0.63x |
+
+Everything from 257 bytes up wins, by 1.3x to 5.7x.  Accounts around 165
+bytes are at 0.93x and the tiniest shapes at 0.4-0.65x, and since
+`spl-token account` alone is 30% of the weighted time, that is what keeps
+the mix at +37%/+34% rather than 3x.
+
+### Why the small sparse accounts do not win
+
+A 165 byte account is 3 blocks, so fd_zle14 runs 3 group dispatches
+where fd_zle11 runs 2 token emits, and the work per group cannot go much
+below 30 instructions (16 of dispatch: the terminator scan, the boundary
+tests and the kind/count branch; 14-18 of emit).  Measured for
+`spl-token account`, decode: 157 instructions in 28 cycles against
+fd_zle11's 132 in 25.  Adding a dedicated small-input path was costed
+and rejected -- its gate, its own framing and its copy-out come to about
+what the general path already spends.
+
+The encoder's small-account gap has a different shape: it scans with
+AVX-512 either way, and what it loses is framing (2 byte chunk header,
+the header computation, and the literal copy out of the chunk's scratch)
+against fd_zle11's near zero.
+
+### Traps measured along the way
+
+- **Straight-line mask builds beat a generic one by a mile.**  The exact
+  emit path (used for the chunk's last group and whenever the sloppy
+  stores have no room) built the literal mask with an 8 slot bzhi/xor
+  loop plus a "force unused slots" step: 23 instructions.  Replacing it
+  with one straight-line sequence per list length -- three instructions
+  per position, no force step, since the length is known -- took decode
+  from 36.6 to 41.8 GB/s (**+13%**).  Keeping an 8 slot fallback for the
+  lengths only a corrupt stream can produce costs nothing.
+- **Splitting the emit on "is this block 64 bytes" was worth 7%.**  A
+  full block needs no clip on its keep mask and no mask on its store;
+  only the blob's last block does.  41.8 -> 44.8 GB/s.
+- **A read-modify-write on bytes a `vpcompressb` just stored costs ~8
+  cycles.**  Terminating the position list with `orb $0x80,-1(%rdi,%rcx)`
+  right after the compress store cost 8.7 of 46 cycles on a 165 byte
+  encode.  Recomputing the last position (`lzcnt`, `xor $63`, `or
+  $0x80`) and storing that byte plainly over the compressed one is three
+  instructions more and eight cycles less.
+- **Store-to-load forwarding does not happen when the load is wider than
+  the store.**  The chunk's literal copy (scratch -> output) costs 12
+  cycles on a 1 byte input and 10 on a 32 byte one, nearly all stall,
+  because a 64 byte load covers bytes a masked compress store wrote.  It
+  amortizes to 3 cycles by 165 bytes and to nothing above that, which is
+  why the scratch stayed -- and why "decode the tail into a stack block
+  so the sloppy paths stay legal" was rejected: the copy back out pays
+  the same stall.
+- **A hot register is worth more than two instructions.**  Moving the
+  chunk's control end (2 uses per group) into a stack slot to save a
+  push/pop pair cost 12% of decode.  Moving the literal read limit (1
+  use) gained 2%, and the last block's size (1 use per chunk) gained 3%.
+- **Single-shape A/B is misleading.**  Short exact paths for a one-block
+  zero or literal run as a chunk's last group measured 5 cycles *slower*
+  on `spl-token account` alone and 3% *faster* on the mix.  Only medians
+  of 5-9 whole-bench runs are worth acting on: single mix runs swing 5%,
+  single shapes much more, and the decode mix here is bimodal at ~39 and
+  ~46 GB/s depending on where the code lands.
+- **The bench overlaps calls.**  Nothing carries a dependency from one
+  `fd_zle14_decompress` to the next, so the loop measures throughput,
+  not latency: instruction count predicted every result far better than
+  dependency chains did.  The decoder's per-group control load chain
+  looked like the problem for a long time and was not (software
+  pipelining that load into the previous group's emit bought 4%, where
+  the instruction cuts above bought 25%).
+- **The sloppy stores still earn their keep.**  With the exact path down
+  to ~25 instructions, routing *every* position list through it (and
+  deleting the sloppy paths and their two boundary tests) measured 41.0
+  against the hybrid's 45.7.  Overlapping 64 byte stores beat one
+  `vpexpandb` wherever there is room for them.
+- Zen 5 byte granular compress/expand are not cheap: `vpcompressb` to
+  memory is 3 cycles of throughput, to a register 5, and `vpexpandb` 5
+  either way (measured).  A block's literals cost one `vpcompressb`,
+  which is why the encoder tops out at ~4 cycles per dense block -- it
+  is compress limited, not ALU limited.  Where a block can dodge the
+  compress entirely it is worth doing: a block whose single zero run
+  reaches its end (7% of groups) has one control byte and a literal run
+  that is just the block's own prefix, so both go out with a plain store,
+  and that alone is +1.8% of encode.
+- **ASan cannot see hand-written assembly, so the decoder needed a canary
+  harness.**  Two out of bounds writes survived 100M+ fuzz executions
+  because libFuzzer's ASan instrumentation only covers compiled C: the
+  faults only surfaced later, as "CHECK failed: asan_allocator.cpp" when
+  the corrupted heap metadata was freed, with inputs that did not
+  reproduce standalone.  A 30 line harness that puts 512 byte 0xA5 walls
+  either side of both buffers and checks them after every call found the
+  second one in seconds and shrank it to 12 significant bytes.  Any
+  assembly codec in this tree wants one.
+- **A corrupt stream can set bits the coder never sets.**  The decoder's
+  sloppy emit paths store 64 bytes at each segment offset, which is legal
+  while the offsets are the 0..63 the format allows -- but a position byte
+  with bit 6 set reads as 64..127, and the store then reached 191 bytes
+  into a block with 128 bytes of slack.  One `andq` of the whole control
+  word against 0x3F3F3F3F3F3F3F3F, right after the terminator scan, pins
+  every position in range and pays for itself by replacing the per
+  position clamps the paths already had.  The same class of bug bit the
+  third literal run's offset in the four position path, where p2-p1 can
+  go negative and wrap the load address below the literal cursor.
+- **A decoder scratch has to be sized for the field, not for what the
+  encoder does with it.**  The chunk header's control size is 9 bits, so
+  a stream can claim 511 control bytes; the decoder's padded copy of that
+  region (used when the 8 byte control reads would run past the blob) was
+  384 bytes, and 511 of them walked over the saved registers and the
+  return address.  `fuzz_zle14_decompress` found it in 500k execs once
+  the encoder started emitting chunks long enough to make the copy path
+  common -- a reminder that the decoder's bounds come from the format's
+  field widths, never from the encoder's habits.
+- **Chunks should end on their fields, not on a byte count.**  Ending a
+  chunk every 2048 input bytes made long zero runs pay a header every
+  2 KiB; letting a chunk take another span while its control field has
+  room, and letting a zero run scan out to the 64 blocks one group can
+  code, cut `serum v3 queue 64K` from 0.17% to 0.05% of raw and lifted
+  `openbook v1 queue` encode 30%.  The control field is 9 bits, so the
+  chunk has to stop at ctl_sz 200: a span can add 288 bytes of control
+  and 488 still fits.  (Found by fuzzing: at 480 it overflowed and the
+  stream was unparseable.)
+
+### Correctness
+
+`test_zle14` checks the assembly byte for byte against
+`fd_zle14_ref_compress` over every shape it could think of (all sizes
+1..64 of six textures, runs astride block boundaries, chunk span edges,
+zero tails to 8 MiB, mask-mode texture, 40k structured random cases),
+round trips through both decoders, and checks the compress bound, that
+nothing but the literal copy's slack is written past the output, that
+nothing is written past `data_sz`, that one byte less capacity is
+reported rather than written, and that extra capacity changes nothing.
+`fuzz_zle14_diff` (ASan, differential + round trip + bound + canary) ran
+over 100M execs across the session with no findings, and
+`fuzz_zle14_decompress` (ASan, arbitrary bytes into exact sized heap
+buffers, plus a re-compress round trip of whatever it accepts) found
+nothing.
+
+### Left on the table
+
+- The decoder's group dispatch is 16 instructions and roughly half of
+  the small-account cost; a jump table on the first control byte trades
+  two of them for an indirect branch, untested.
+- The encoder still spends ~21 instructions per chunk on the header and
+  the literal copy.  Most of that is avoidable if the literal count
+  moves into the header instead of the control count, which needs a
+  third header byte (1.3% of ratio on a 165 byte account).
+- fd_zle14 has no scalar fallback: `Local.mk` only builds it under
+  `FD_HAS_AVX512`, and the API is AVX-512 only for now.
