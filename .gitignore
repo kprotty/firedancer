@@ -86,3 +86,6 @@ venv
 
 # Version derive
 src/util/fd_version_generated.h
+
+# Downloaded snapshots
+/snapshot.tar.zst

@@ -1,0 +1,12 @@
+out/
+snapscan
+snapscan2
+snapscan3
+corpstat
+corpsplit
+corpgroup
+refscan
+oracle
+snapscan_w
+__pycache__/
+*.bak
